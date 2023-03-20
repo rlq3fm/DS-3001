@@ -1,0 +1,568 @@
+---
+title: "KNN_lab_2"
+author: "Reese Quillian"
+date: "3/13/2023"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# load libraries
+library(tidyverse)
+library(psych)
+library(mltools)
+library(data.table)
+library(caret)
+library(mice)
+library(class)
+library(plotly)
+library(MLmetrics)
+```
+
+Instructions:
+Let's build a kNN model using the college completion data or job placement data from last week.
+
+The data is messy and you have a degrees of freedom problem, as in, we have too many features.  
+
+You've done most of the hard work already, so you should be ready to move forward with building your model. 
+
+Use the question/target variable you submitted from last week and build a model to answer the question you created for this dataset. 
+
+Build and optimize a kNN model to predict your target variable. Meaning use the tune set to select the correct k value. 
+
+Experiment with the threshold function, what happens at higher and lower thresholds. Document what you see in comments. 
+
+Evaluate the results using the confusion matrix (at the default threshold). Then talk through your question, summarize what concerns or positive elements do you have about the model? 
+
+
+Bonus: Adjust the function that selects k to output on Specificity instead of Accuracy
+
+## College Completion Model
+
+### Question: Predicting whether an institution has a greater than 90% retention rate. 
+Note that this question was changed because the original data about SAT scores had too many missing values. (My question on Lab 4 was predicting if a college's median SAT value is above or below the average of other schools included in the dataset.)
+
+
+#### Data cleaning - by Prof Wright
+The data preparation work I did originally is included at the end of this document.
+
+```{r}
+url <- "https://query.data.world/s/yd5wiazzlj7aahmn4x37y7zq5pyh2h"
+
+grad_data <- read_csv(url)
+
+View(grad_data)# we can tell that a large number of the features will likely 
+#need to be removed and we've got a rather large number of features/ 
+
+# readme for the dataset - https://data.world/databeats/college-completion/workspace/file?filename=README.txt
+
+
+#This will allow us to pull column numbers for sub-setting  
+column_index <- tibble(colnames(grad_data))
+
+print(column_index, n=62)#input the n=62 to be able to see all the features
+
+#Use the mice package to track the missing values
+
+#Why are we not seeing missing values? 
+md.pattern(grad_data, rotate.names = TRUE)
+
+#replace the null with NA
+grad_data[grad_data=="NULL"] <- NA
+
+md.pattern(grad_data, rotate.names = TRUE)
+
+colSums(is.na(grad_data))#?colSums
+print(column_index, n=62)
+
+x <- 40:56 #create a list so we don't have to type 16 numbers out
+
+#Most of these columns have a good number of missing values or are not useful.  
+grad_data_1 <- grad_data[ ,c(-10,-11,-12,-x,-28,-29,-37,-57,-61)]
+
+#Make a new index
+column_index_1 <- tibble(colnames(grad_data_1))
+colSums(is.na(grad_data_1))
+print(column_index_1, n=37)
+
+#Looking better
+View(grad_data_2)
+
+#Dropped a bunch more that appeared to be repeats or not predictive, this time using the the names and subset/select 
+grad_data_2 <- subset(grad_data_1, select = -c(unitid,city,state,basic,med_sat_value,med_sat_percentile,counted_pct))
+
+summary(grad_data_2)
+colSums(is.na(grad_data_2))
+
+#In looking at the HBCU (historically black colleges and universities, seems
+# like the NAs should be 0s, let's change that back and convert to a factor)
+grad_data_2$hbcu <- as.factor(ifelse(is.na(grad_data_2$hbcu),0,1))
+#same for flagship
+grad_data_2$flagship <- as.factor(ifelse(is.na(grad_data_2$flagship),0,1))
+
+#Ok better
+table(grad_data_2$hbcu)
+str(grad_data_2)
+
+#convert several variables to factors 
+x <- c("level","control")
+grad_data_2[,x] <- lapply(grad_data_2[,x], as.factor)
+
+#convert several variables to numbers 
+x <- c("ft_fac_percentile", "grad_100_value","grad_100_percentile","grad_150_value","grad_150_percentile","retain_value","cohort_size","ft_fac_value")
+
+grad_data_2[,x] <- lapply(grad_data_2[,x], as.numeric)
+
+#Looking better
+str(grad_data_2)
+```
+
+### Missing Data 
+```{r}
+#Now let's take a look at missing data issue
+md.pattern(grad_data_2, rotate.names = TRUE)
+
+#Delete the rest of the NA columns and drop the college names 
+grad_data_2 <- grad_data_2[,-1]
+grad_data_3 <- grad_data_2[complete.cases(grad_data_2), ]
+
+str(grad_data_3)#Ok looking good, still likely want to drop a few columns,need to normalize and one_hot encode before we move forward with model building.
+```
+
+
+```{r}
+str(grad_data_3)
+# drop columns: awards_per_state_value and national (just giving averages)
+# same for exp_award
+# also dropping state_sector_ct and carnegie_ct
+column_index_3 <- tibble(colnames(grad_data_3))
+print(column_index_3,n=29)
+
+grad_data_3 <- grad_data_3[,-c(7:8,10:11,27:28)]
+str(grad_data_3)
+```
+
+
+
+combine control into just public/private:
+```{r}
+grad_data_3$control <- fct_collapse(grad_data_3$control, 
+                           public = "Public",
+                           private = c("Private for-profit",
+                                       "Private not-for-profit"))
+table(grad_data_3$control)
+str(grad_data_3)
+```
+
+create target variable: above (1) /below (0) 85% retention
+```{r}
+grad_data_3 <- grad_data_3 %>% mutate(retain = case_when(
+                                retain_value >= 85.0 ~ 1,
+                                retain_value < 85.0 ~ 0))
+grad_data_3$retain <- as.factor(grad_data_3$retain)
+str(grad_data_3)
+```
+
+
+```{r}
+# function from class:
+normalize <- function(x){
+  # x is a numeric vector because the functions min and max require
+  #numeric inputs
+ (x - min(x)) / (max(x) - min(x))#numerator subtracts the minimum value of x from the entire column, denominator essentially calculates the range of x 
+}
+```
+
+
+```{r} 
+# normalize 
+x <- names(select_if(grad_data_3, is.numeric))
+x
+grad_data_3[x] <- lapply(grad_data_3[x], normalize)
+str(grad_data_3)
+```
+
+
+```{r}
+# one hot encoding
+x <- names(select_if(grad_data_3, is.factor))#names collects the columns names, select_if selects columns based on a criteria in this example it's is.factor
+x
+
+# level, control columns will split
+grad_data <- one_hot(as.data.table(grad_data_3),cols = x,sparsifyNAs = TRUE,naCols = FALSE,dropCols = TRUE,dropUnusedLevels = TRUE)
+str(grad_data)
+
+# we want to predict whether an institution has >85% retention, so drop retain_0
+grad_data <- grad_data[,-28]
+```
+
+
+Troubleshooting: to prevent model from memorizing data, I am dropping more columns that are highly correlated with each other:
+
+```{r}
+column_index_3 <- tibble(colnames(grad_data))
+print(column_index_3,n=28)
+
+grad_data <- grad_data[,-c(7:8,12,14:15,17,19:24,26)]
+str(grad_data)
+```
+
+
+Troubleshooting again: dropping more columns
+```{r}
+column_index_3 <- tibble(colnames(grad_data))
+print(column_index_3,n=28)
+
+grad_data <- grad_data[,c(4,6,7,9,10,13,15)]
+str(grad_data)
+```
+
+
+#### Data is ready to build the model.
+
+```{r}
+# Check the composition of labels in the data set. 
+table(grad_data$retain_1)[2]
+table(grad_data$retain_1)[2]/sum(table(grad_data$retain_1))
+
+# This means that at random, we have a 13% chance of correctly picking out if a school is public
+
+part_index_1 <- createDataPartition(grad_data$retain_1,
+                                          times=1,
+                                          p = 0.7,
+                                          groups=1,
+                                          list=FALSE)
+View(part_index_1)
+
+train <- grad_data[part_index_1,] #2360 observations
+str(train)
+```
+
+
+```{r}
+# now create the tuning and testing sets
+tune_and_test <- grad_data[-part_index_1,]
+
+
+#The we need to use the function again to create the tuning set 
+
+tune_and_test_index <- createDataPartition(tune_and_test$retain_1,
+                                           p = .5,
+                                           list = FALSE,
+                                           times = 1)
+
+tune <- tune_and_test[tune_and_test_index, ] # 506 observations
+test <- tune_and_test[-tune_and_test_index, ] # 505 observations
+```
+
+
+##### Train the model
+Start with choosing a k=11, then we will optimize it
+
+```{r}
+# k-Nearest Neighbor is a randomized algorithm, so make sure to
+# use set.seed() to make your results repeatable.
+set.seed(1000)
+grad_11NN <-  knn(train = train, #<- training set cases
+               test = tune,     #<- tune set cases
+               cl = train$retain_1,#<- category for true classification
+               k = 11, #<- number of neighbors considered
+               prob= TRUE,
+               use.all = TRUE) # provides the output in probabilities 
+
+# View the output.
+str(grad_11NN)
+str(test)
+
+table(grad_11NN)
+table(tune$retain_1)
+
+grad_11NN
+
+View(as.tibble(grad_11NN))
+View(as.tibble(attr(grad_11NN,"prob")))
+```
+
+The model is overfit. Reproducing the tuning dataset perfectly (memorizing it), which is seen in the table results as well as the probability of each observation being 1. 
+
+
+Choosing K 
+
+```{r}
+chooseK = function(k, train_set, val_set, train_class, val_class){
+  # Build knn with k neighbors considered.
+  set.seed(1)
+  class_knn = knn(train = train_set,    #<- training set cases
+                  test = val_set,       #<- test set cases
+                  cl = train_class,     #<- category for classification
+                  k = k,                #<- number of neighbors considered
+                  use.all = TRUE)       #<- control ties between class assignments
+                                        #   If true, all distances equal to the kth 
+                                        #   largest are included
+  conf_mat = table(class_knn, val_class)
+  
+  # Calculate the accuracy.
+  accu = sum(conf_mat[row(conf_mat) == col(conf_mat)]) / sum(conf_mat)                         
+  cbind(k = k, accuracy = accu)
+}
+```
+
+
+```{r}
+knn_different_k = sapply(seq(1, 21, by = 2),  #<- set k to be odd number from 1 to 21
+                          function(x) chooseK(x, 
+                          train_set = train,
+                          val_set = tune,
+                          train_class = train$retain_1,
+                          val_class = tune$retain_1))
+
+View(knn_different_k)
+```
+
+
+```{r}
+# Reformatting the results to graph
+View(knn_different_k)
+class(knn_different_k)#matrix 
+
+knn_different_k = tibble(k = knn_different_k[1,],
+                             accuracy = knn_different_k[2,])
+
+View(test)
+View(knn_different_k)
+
+# Plot accuracy vs. k.
+
+ggplot(knn_different_k,
+       aes(x = k, y = accuracy)) +
+  geom_line(color = "orange", size = 1.5) +
+  geom_point(size = 3)
+
+dev.off()
+```
+
+Because the model is memorizing the data, all k 1-21 yield an accuracy of 1. In other words, the following variables (control_public, hbcu_1, student_count, exp_award_value, ft_pct, and ft_fac_value) are able to predict perfectly whether an institution has a retention rate above 85%, when compared to the tuning dataset. However, this will not be true when shown to new data (test data).
+
+
+#### Threshold Experimentation
+
+```{r}
+grad_prob_1 <- tibble(attr(grad_11NN, "prob"))
+
+final_model <- tibble(k_prob=grad_prob_1$`attr(grad_11NN, "prob")`,pred=grad_11NN,target=tune$retain_1)
+
+View(final_model)
+
+#Need to convert this to the likelihood to be in the poss class.
+final_model$pos_prec <- ifelse(final_model$pred == 0, 1-final_model$k_prob, final_model$k_prob)
+
+View(final_model)
+
+#Needs to be a factor to be correctly  
+final_model$target <- as.factor(final_model$target)
+
+densityplot(final_model$pos_prec)
+
+#confusionMatrix from Caret package
+confusionMatrix(final_model$pred, final_model$target, positive = "1", dnn=c("Prediction", "Actual"), mode = "sens_spec")
+
+adjust_thres <- function(x, y, z) {
+  #x=pred_probablities, y=threshold, z=tune_outcome
+  thres <- as.factor(ifelse(x > y, 1,0))
+  confusionMatrix(thres, z, positive = "1", dnn=c("Prediction", "Actual"), mode = "everything")
+}
+
+str(final_model)
+
+```
+
+```{r}
+adjust_thres(final_model$pos_prec,.30,as.factor(final_model$target))
+adjust_thres(final_model$pos_prec,.70,as.factor(final_model$target))
+```
+
+Again, because we have an overfit model, adjusting the threshold is not changing the results. The model is predicting certain observations with a probability of 1, so no matter what the threshold moves to the results will not change for this model. 
+
+#### Conclusions
+Evaluate the results using the confusion matrix (at the default threshold). Then talk through your question, summarize what concerns or positive elements do you have about the model?
+
+```{r}
+# confusion matrix:
+
+kNN_res = table(grad_11NN,
+                tune$retain_1)
+kNN_res
+
+# get accuracy, sensitivity, specificity
+confusionMatrix(as.factor(grad_11NN), as.factor(tune$retain_1), positive = "1", dnn=c("Prediction", "Actual"), mode = "sens_spec")
+```
+
+Overall, the results above show that the following information:
+  * if institution is public
+  * if institution is a historically black college / university
+  * total number of undergraduate students
+  * estimated educational spending per academic award
+  * percentage of full-time undergraduates
+  * percentage of full-time faculty
+  
+is predictive of whether an institution has a retention rate (share of freshmen retained for a second year). However, the results clearly show overfitting, since the model demonstrates perfect performance. Because of this, we can assume that this model would not generalize well when shown new data. So even though these features may have predictive power, more/better data is needed for a model that can be generalized to more institutions. Also, in this model we simply removed all non-complete cases (i.e. any institutions missing any data), which could have introduced bias to the model. 
+
+
+Some other evaluation tools... (all show perfect performance but keeping them here for reference)
+```{r}
+library(ROCR)
+pred <- prediction(final_model$pos_prec,final_model$target)
+plot(knn_perf, colorize=TRUE)
+abline(a=0, b= 1)
+
+knn_perf_AUC <- performance(pred,"auc")
+
+print(knn_perf_AUC@y.values)
+
+library(MLmetrics)
+LogLoss(as.numeric(final_model$pos_prec), as.numeric(final_model$target))
+
+F1_Score(y_pred = final_model$pred, y_true = final_model$target, positive = "1")
+```
+
+#### Bonus
+Adjust the function that selects k to output on Specificity instead of Accuracy
+
+```{r}
+# BONUS: function to change
+
+# How does "k" affect classification accuracy? Let's create a function
+# to calculate classification accuracy based on the number of "k."
+chooseK_spec = function(k, train_set, val_set, train_class, val_class){
+  # Build knn with k neighbors considered.
+  set.seed(1)
+  class_knn = knn(train = train_set,    #<- training set cases
+                  test = val_set,       #<- test set cases
+                  cl = train_class,     #<- category for classification
+                  k = k,                #<- number of neighbors considered
+                  use.all = TRUE)       #<- control ties between class assignments
+                                        #   If true, all distances equal to the kth 
+                                        #   largest are included
+  conf_mat = table(class_knn, val_class)
+  
+  # Calculate the accuracy.
+  # accu = sum(conf_mat[row(conf_mat) == col(conf_mat)]) / sum(conf_mat)                         
+  # cbind(k = k, accuracy = accu)
+  
+  # Calculate the specificity
+  spec = conf_mat[1,1] / sum(conf_mat[row(conf_mat) == col(conf_mat)])     
+  # true negatives are at top left
+  cbind(k = k, spec = spec)
+}
+#Accuracy = TP+TN/(TP+TN+FP+FN)
+#specificity, true negative rate = TN/TN+FP
+```
+
+```{r}
+knn_different_k_spec = sapply(seq(1, 21, by = 2),  #<- set k to be odd number from 1 to 21
+                          function(x) chooseK_spec(x, 
+                          train_set = train,
+                          val_set = tune,
+                          train_class = train$retain_1,
+                          val_class = tune$retain_1))
+
+View(knn_different_k_spec)
+```
+
+
+Under this function, there is also no variance between k values.
+
+
+### OLD CODE - DO NOT USE
+
+#### Data Cleaning (from Lab 4)
+
+```{r}
+# load data
+cc <- read_csv("C:/Users/Student/OneDrive - University of Virginia/Documents/Data Science/DS-3001/Assignments/data/cc_institution_details.csv")
+
+str(cc)
+```
+
+drop variables now so it is easier to work with
+```{r}
+# keep the following variables: level, control, student_count, awards_per_value,exp_award_value,med_sat_value, aid value, retain_value, grad_100_value (drop everything else)
+cc<-cc[,c(5:6,13:14,17,21,24,26,36,30)]
+```
+
+correct variable types
+```{r}
+(column_index <- tibble(colnames(cc)))
+str(cc)
+# change to factor: level (1), control (2)
+# change to number: med_sat_value, retain_value, grad_100_value (7,9,10)
+
+cc[,c(1:2)] <- lapply(cc[,c(1:2)], as.factor)
+str(cc)
+
+cc[,c(7,9,10)] <- lapply(cc[,c(7,9,10)], as.numeric)
+str(cc)
+```
+
+check factor levels 
+```{r}
+table(cc$level)
+table(cc$control)
+
+# seems ok, no need to combine
+```
+
+only complete cases can be used in the model (no NA values)
+```{r}
+cc_complete <- cc %>% filter(complete.cases(cc)==TRUE) # 1319 observations
+```
+
+
+normalize numeric variables
+
+
+```{r}
+str(cc_complete)
+
+#use lapply to normalize the numeric values 
+num_cols <- names(select_if(cc_complete, is.numeric))
+num_cols
+cc_complete[num_cols] <- lapply(cc_complete[num_cols], normalize)
+str(cc_complete)
+```
+
+
+create target variable: above/below average
+```{r}
+# calculate average of dataset:
+avg <- mean(cc_complete$med_sat_value)
+
+cc_complete <- cc_complete %>% mutate(sat=case_when(
+                                  med_sat_value >= avg ~ 1,
+                                  med_sat_value < avg ~ 0))
+
+str(cc_complete)
+cc_complete$sat <- as.factor(cc_complete$sat)
+#now we can drop the old sat column:
+cc_complete <- cc_complete[,-7]
+View(cc_complete)
+```
+
+
+one hot encoding
+```{r}
+fac <- names(select_if(cc_complete, is.factor))#names collects the columns names, select_if selects columns based on a criteria in this example it's is.factor
+fac
+
+# level, control columns will split
+cc <- one_hot(as.data.table(cc_complete),cols = fac,sparsifyNAs = TRUE,naCols = FALSE,dropCols = TRUE,dropUnusedLevels = TRUE)
+
+str(cc)
+cc <- cc[,-13]
+```
+

@@ -1,0 +1,253 @@
+---
+title: "Eval_Lab"
+author: "Reese Quillian"
+date: "3/20/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The most important part of any machine learning model (or any model, really) is understanding and defining the models weaknesses and/or vulnerabilities. 
+
+To do so we are going to practice on a familiar dataset and use a method we just learned, kNN. For this lab use the Job Placement or Bank dataset.  
+
+## Part 1. Develop a ML question using status as the target variable. In consideration of all the metrics we discussed what are a couple of key metrics that should be tracked given the question you are trying to solve?
+
+We want to predict whether a customer will sign up for a credit card after being showed a certain marketing campaign (denoted by the signed_up variable). The key metrics to track are:
+
+  * sensitivity (want our model to be very accurate at predicting who actually signs up)
+  * ROC (want to have a good sensitivity without getting too complex)
+
+## Part 2. Create a kNN model that can answer your question, using all the appropriate prep methods we discussed.   
+
+```{r}
+# load libraries
+library(caret)
+library(tidyverse)
+library(class)
+library(plotly)
+library(mice)
+library(MLmetrics)
+library(mltools)
+library(data.table)
+```
+
+
+### Data Prep
+
+Load data
+
+```{r}
+bank_data = read_csv("C:/Users/Student/OneDrive - University of Virginia/Documents/Data Science/DS-3001/Class-DS-3001/data/bank.csv")
+```
+Clean data
+
+```{r}
+# collapse factors
+bank_data$job <- fct_collapse(bank_data$job, 
+                           Employed = c("admin.",
+                                        "blue-collar",
+                                        "entrepreneur",
+                                        "housemaid",
+                                        "management",
+                                        "self-employed",
+                                        "services",
+                                        "technician"),
+                           Unemployed= c("student",
+                                         "unemployed",
+                                         "unknown", "retired"))
+```
+
+
+```{r}
+# convert columns to factors
+(column_index <- tibble(colnames(bank_data)))
+bank_data[,c(2:5,8,7,13,14)] <- lapply(bank_data[,c(2:5,8,7,13,14)], as.factor)
+# job, marital, education, default, housing, contact, poutcome, signed up
+str(bank_data)
+md.pattern(bank_data,rotate.names = TRUE)
+```
+```{r}
+# normalize numeric features
+# normalize function
+normalize <- function(x){
+  # x is a numeric vector because the functions min and max require
+  #numeric inputs
+ (x - min(x)) / (max(x) - min(x))#numerator subtracts the minimum value of x from the entire column, denominator essentially calculates the range of x 
+}
+```
+
+
+```{r}
+abc <- names(select_if(bank_data, is.numeric))
+bank_data[abc] <- lapply(bank_data[abc], normalize)
+
+str(bank_data)
+```
+
+
+```{r}
+# one hot encode
+ab_c <- names(select_if(bank_data, is.factor))
+
+bank_data <- one_hot(as.data.table(bank_data),cols=ab_c,sparsifyNAs = TRUE,naCols = FALSE,dropCols = TRUE,dropUnusedLevels = TRUE)
+
+#Dropping signed up_0
+bank_data <- bank_data[,-27]
+#rename to signed up
+colnames(bank_data)[27] = "signed up"
+
+str(bank_data)
+```
+
+
+kNN data prep: tuning and training sets
+
+```{r}
+part_index_1 <- createDataPartition(bank_data$`signed up`,
+                                           times=1,
+                                           p = 0.70,
+                                           groups=1,
+                                           list=FALSE)
+
+train <- bank_data[part_index_1,]
+tune_and_test <- bank_data[-part_index_1, ]
+
+tune_and_test_index <- createDataPartition(tune_and_test$`signed up`,
+                                           p = .5,
+                                           list = FALSE,
+                                           times = 1)
+
+tune <- tune_and_test[tune_and_test_index, ]
+test <- tune_and_test[-tune_and_test_index, ]
+
+```
+
+
+
+### Model Build
+
+```{r}
+set.seed(1982)
+
+# using 5 neighbors 
+# code from class notes
+
+bank_5NN <-  knn(train = train[,-27],
+               test = tune[,-27], #<- test set cases
+               cl = train$`signed up`,#<- category for true classification
+               k = 5,#<- number of neighbors considered
+               use.all = TRUE,
+               prob = TRUE)#creates the prob as a attribute of the output
+
+#note this is a vector of predication with the probabilities as a output, but we need to convert this to reflect the positive class.  
+str(bank_5NN)
+```
+
+## Part 3. Evaluate the model using the metrics you identified in the first question. Make sure to calculate/reference the prevalence to provide a baseline for some of these measures. Summarize the output of the key metrics you established in part 1. 
+
+### Prep info from model in previous section
+
+```{r}
+#Pulling out the probabilities  
+bank_prob_1 <- tibble(attr(bank_5NN, "prob"))
+
+#Prob that are mixed
+View(bank_prob_1)
+
+#Building a dataframe includes the columns 
+final_model <- tibble(k_prob=bank_prob_1$`attr(bank_5NN, "prob")`,pred=bank_5NN,target=tune$`signed up`)
+
+#Need to convert this to the likelihood to be in the poss class.
+final_model$pos_prec <- ifelse(final_model$pred == 0, 1-final_model$k_prob, final_model$k_prob)
+final_model$target <- as.factor(final_model$target)
+View(final_model)
+```
+
+
+### 1. Sensitivity
+get the confusion matrix first:
+
+```{r}
+#confusion matrix
+confusionMatrix(final_model$pred, final_model$target, positive = "1", dnn=c("Prediction", "Actual"), mode = "sens_spec")
+```
+```{r}
+table(bank_data$`signed up`)
+5074 / (5074+38554)
+```
+
+Even though the model has an accuracy of almost 88%, the sensitivity is quite low. This is because our prevalence is only 11.6%, so the model is guessing most observations to be negative class and still having high accuracy. This is why we want to improve sensitivity, to prevent the model from just always guessing that the person did not sign up. 
+
+
+### ROC
+
+```{r}
+library(ROCR)
+pred <- prediction(final_model$pos_prec,final_model$target)
+View(pred)
+
+knn_perf <- performance(pred,"tpr","fpr")
+
+plot(knn_perf, colorize=TRUE) + abline(a=0, b= 1)
+```
+
+Based on the plot above, we can see that we can achieve a high true positive rate (aka sensitivity) by lowering the threshold. There is a tradeoff here, since we don't want to make it too low and then lose all specificity We will experiment with this in part 5. 
+
+```{r}
+knn_perf_AUC <- performance(pred,"auc")
+
+print(knn_perf_AUC@y.values) # pretty good
+```
+
+## Part 4.  Consider where miss-classification errors (via confusion matrix) are occurring, is there a pattern? If so discuss this pattern and why you think this is the case. 
+
+```{r}
+# confusion matrix
+kNN_res = table(bank_5NN,
+                tune$`signed up`)
+kNN_res # this is at the baseline threshold of 0.5
+```
+
+At the baseline threshold of 0.5, the model experiences more than twice as many false negatives than false positives (we have high specificity but low sensitivity). As mentioned before, this is likely due to the prevalence of customers who did sign up: only ~11% of observations are positive class (a customer who did actually sign up), meaning the model could achieve 89% accuracy overall by guessing negative every time. We can raise our sensitivity by lowering the threshold - which is done in the next section.
+
+## Part 5. Based on your exploration in Part 4, change the threshold using the function provided in the in-class example, what differences do you see in the evaluation metrics? Speak specifically to the metrics that are best suited to address the question you are trying to answer from part 1. 
+
+```{r}
+adjust_thres <- function(x, y, z) {
+  #x=pred_probablities, y=threshold, z=test_outcome
+  thres <- as.factor(ifelse(x > y, 1,0))
+  confusionMatrix(thres, z, positive = "1", dnn=c("Prediction", "Actual"), mode = "everything")
+}
+```
+
+```{r}
+adjust_thres(final_model$pos_prec,.1,final_model$target)
+```
+
+```{r}
+adjust_thres(final_model$pos_prec,.2,final_model$target)
+```
+
+```{r}
+adjust_thres(final_model$pos_prec,.4,final_model$target)
+```
+
+
+The lower the threshold, the higher the sensitivity. We can achieve a sensitivity rate of greater than 50% (or better than a random guess) by decreasing the threshold to 0.2. In doing so, accuracy and specificity drop a bit, but not by much. With a threshold greater than 0.2, sensitivity is below 50%, but a high specificity of 90% or greater keeps accuracy up.
+
+This trends can also observed in the ROC curve from earlier, where the darker blue section of the curve is the thresholds below 0.2, and the teal section is between 0.2 and 0.4.
+
+## Part 6. Summarize your findings (a paragraph or two) speaking through your question, what does the evaluation outputs mean when answering the question you've proposed?
+
+The question we wanted to answer was whether the data could predict whether a customer would sign up for a credit card. The data we had available included personal information (marital status, education level, age) as well as information related to their balance/time with the bank. In using a kNN model with k = 5 to answer this question, we used to metrics to track model performance: sensitivity and ROC. Sensitivity is important to make sure the model can perform well on the customers that actually are signing up, despite a low base rate in the data. ROC allows us to look at the tradeoffs between improving sensitivity without sacrificing specificity.
+
+For high accuracy and specificity, and a sensitivity rate greater than 50%, the classification threshold should be lowered from 0.5 to 0.2. Doing this provides the following results:
+
+    * accuracy = 0.87
+    * sensitivity = 0.54
+    * specificity = 0.92
+  
+Going forward, this model could also be improved by getting better data, experimenting with less variables, and adjusting the k value. 

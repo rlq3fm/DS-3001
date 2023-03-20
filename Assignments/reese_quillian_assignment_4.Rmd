@@ -1,0 +1,325 @@
+---
+title: "Assignment 4 Data Preparation"
+author: "Reese Quillian"
+date: "2/27/2023"
+output:
+  html_document:
+    toc: TRUE
+    theme: flatly
+    toc_float: TRUE
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,warning=FALSE,message=FALSE)
+```
+
+
+```{r, include=FALSE}
+# load libraries
+library(tidyverse)
+library(psych)
+library(mltools)
+library(data.table)
+library(caret)
+#library(gradDescent)
+library(mice)
+```
+
+
+## College Completion
+
+### Question: Predict the median SAT value.
+
+### Step two: Work through the steps outlined in the examples to include the following elements:
+
+  * What is an independent Business Metric for your problem?
+Assuming that a higher median SAT means more highly qualified students are applying, an independent business metric could be the average GPA of the college.
+
+  * Data preparation:  
+    * correct variable type as needed
+    * collapse factor levels as needed
+    * one-hot encoding factor variables
+    * normalize the continuous variables
+    * drop unneeded variables
+    * create target variable if needed
+  * Calculate the prevalence
+  * Create the necessary data partitions (Train, Tune, Test)
+
+```{r}
+# load data
+cc <- read_csv("C:/Users/Student/OneDrive - University of Virginia/Documents/Data Science/DS-3001/Assignments/data/cc_institution_details.csv")
+
+str(cc)
+```
+
+
+correct type
+```{r}
+#change to factor: level, hbcu, flagship, control
+# change to number: endow_vlaue, endow_percentile, grad_100_value, grad_100_percentile, grad_150_value, grad_150_percentile, retain_value, retain_percentile, all vsa columns
+
+(column_index <- tibble(colnames(cc)))
+cc[,c(5,6,8,9)] <- lapply(cc[,c(5,6,8,9)], as.factor)
+str(cc)
+
+cc[,c(24,28:33,36,37,40:56)] <- lapply(cc[,c(24,28:33,36,37,40:56)], as.numeric)
+str(cc)
+```
+
+check factor levels 
+```{r}
+table(cc$level)
+table(cc$hbcu)
+table(cc$flagship)
+
+# change "null" and "x" to 0 and 1 for hbcu + flagship
+cc$hbcu <- fct_recode(cc$hbcu, "0"="NULL", "1"="X")
+cc$flagship <- fct_recode(cc$flagship, "0"="NULL", "1"="X")
+
+str(cc)
+```
+
+
+drop unnecessary variables
+```{r}
+# keep the following variables: name, city, state, level, control, student_count, awards_per_value,exp_award_value,med_sat_value (drop everything else)
+cc<-cc[,c(2:6,13:14,17,21,24)]
+```
+
+
+normalize numeric variables
+```{r}
+# function from class:
+# added na.rm argument so that NA values are not counted as min
+normalize <- function(x){
+  # x is a numeric vector because the functions min and max require
+  #numeric inputs
+ (x - min(x,na.rm=TRUE)) / (max(x,na.rm=TRUE) - min(x,na.rm=TRUE))#numerator subtracts the minimum value of x from the entire column, denominator essentially calculates the range of x 
+}
+```
+
+```{r}
+str(cc)
+
+# one by one
+cc$student_count <- normalize(cc$student_count)
+cc$awards_per_value <- normalize(cc$awards_per_value)
+cc$exp_award_value <- normalize(cc$exp_award_value)
+cc$ft_pct <- normalize(cc$ft_pct)
+cc$med_sat_value <- normalize(cc$med_sat_value)
+
+#or use lapply to normalize the numeric values 
+num_cols <- names(select_if(cc, is.numeric))
+num_cols
+cc[num_cols] <- lapply(cc[num_cols], normalize)
+str(cc)
+```
+
+
+one hot encoding
+```{r}
+# level, control columns will split
+cc_1h <- one_hot(as.data.table(cc),cols = "auto",sparsifyNAs = TRUE,naCols = FALSE,dropCols = TRUE,dropUnusedLevels = TRUE)
+
+str(cc_1h)
+```
+
+
+prevalence
+```{r}
+# can create target variable of median SAT to be a 1 if above average and a 0 if below:
+
+fivenum(cc_1h$med_sat_value)
+(cc_1h$sat <- cut(cc_1h$med_sat_value,c(-1,.43,1),labels = c(0,1)))
+
+# replace NA values with 0
+cc_1h$sat <- replace(cc_1h$sat, is.na(cc_1h$sat), 0)
+
+# calculate prevalence
+prevalence <- table(cc_1h$sat)[[2]]/length(cc_1h$sat)
+table(cc_1h$sat)
+prevalence
+```
+
+create partitions
+```{r}
+cc_dt <- cc_1h[,-c("chronname","med_sat_value","city","state")]
+
+part_index_1 <- caret::createDataPartition(cc_dt$sat,
+                                           times=1,#number of splits
+                                           p = 0.70,#percentage of split
+                                           groups=1,
+                                           list=FALSE)
+View(part_index_1)
+dim(cc_dt)
+
+train <- cc_dt[part_index_1,]#index the 70%
+tune_and_test <- cc_dt[-part_index_1, ]#index everything but the %70
+
+#The we need to use the function again to create the tuning set 
+
+tune_and_test_index <- createDataPartition(tune_and_test$sat,
+                                           p = .5,
+                                           list = FALSE,
+                                           times = 1)
+
+tune <- tune_and_test[tune_and_test_index, ]
+test <- tune_and_test[-tune_and_test_index, ]
+
+```
+
+```{r}
+dim(train)
+dim(tune)
+dim(test)
+
+table(train$sat)#check the prevalance
+469/(2190+469)
+table(test$sat)
+100/(469+100)
+table(tune$sat) #off by 1 from above
+```
+
+
+### Step three: What do your instincts tell you about the data? Can it address your problem, what areas/items are you worried about?
+
+I think this data can address the problem of predicting median SAT score, although I worry that the classes of above/below average may not be balanced enough. I also worry if some of the features need more cleaning, such as assigning NA values a certain number.
+
+
+## Job placement
+
+### Question: Predict status - whether the person was placed or not placed into a job.
+
+### Step two: Work through the steps outlined in the examples to include the following elements:
+
+  * What is an independent Business Metric for your problem?
+If the model is predicting who is placed into a job correctly, then students would be able to know what qualities may make them more likely to get a job, and work to be more qualified. If this happens, the college may see more recruiters/career fairs coming to campus to recruit students for a job.
+
+  * Data preparation:  
+    * correct variable type as needed
+    * collapse factor levels as needed
+    * one-hot encoding factor variables
+    * normalize the continuous variables
+    * drop unneeded variables
+    * create target variable if needed
+  * Calculate the prevalence
+  * Create the necessary data partitions (Train, Tune, Test)
+ 
+```{r}
+# load data
+jp <- read_csv("C:/Users/Student/OneDrive - University of Virginia/Documents/Data Science/DS-3001/Assignments/data/Placement_Data_Full_Class.csv")
+
+str(jp)
+```
+
+
+correct type
+```{r}
+#change to factor: gender, degree_t, ssc_b, hsc_b, hsc_s, workex, specialisation, status
+
+(column_index <- tibble(colnames(jp)))
+jp[,c(2,4,6,7,9,10,12,14)] <- lapply(jp[,c(2,4,6,7,9,10,12,14)], as.factor)
+
+str(jp)
+```
+
+no need to change factor levels, only have 2-3 for each variable
+
+
+drop unnecessary variables
+```{r}
+# drop serial number
+jp<-jp[,-1]
+```
+
+
+normalize numeric variables
+```{r}
+# function from class:
+normalize <- function(x){
+  # x is a numeric vector because the functions min and max require
+  #numeric inputs
+ (x - min(x,na.rm=TRUE)) / (max(x,na.rm=TRUE) - min(x,na.rm=TRUE))#numerator subtracts the minimum value of x from the entire column, denominator essentially calculates the range of x 
+}
+```
+
+```{r}
+str(jp)
+
+#or use lapply to normalize the numeric values 
+num_cols1 <- names(select_if(jp, is.numeric))
+num_cols1
+jp[num_cols1] <- lapply(jp[num_cols1], normalize)
+str(jp)
+```
+
+
+one hot encoding
+```{r}
+# level, control columns will split
+jp_1h <- one_hot(as.data.table(jp),cols = "auto",sparsifyNAs = TRUE,naCols = FALSE,dropCols = TRUE,dropUnusedLevels = TRUE)
+
+str(jp_1h)
+```
+
+
+prevalence
+```{r}
+# status is already split up into binary columns
+# we will use status_Placed (so 0 = not placed, 1 = placed)
+
+# calculate prevalence
+prevalence <- table(jp_1h$status_Placed)[[2]]/length(jp_1h$status_Placed)
+table(jp_1h$status_Placed)
+prevalence # 0.69
+```
+
+
+create partitions
+```{r}
+# drop unnecessary columns:
+jp_dt <- jp_1h[,-c("ssc_b_Central","ssc_b_Others","hsc_b_Central","hsc_b_Others",
+                   "status_Not Placed")]
+
+jp_part_index_1 <- caret::createDataPartition(jp_dt$status_Placed,
+                                           times=1,#number of splits
+                                           p = 0.70,#percentage of split
+                                           groups=1,
+                                           list=FALSE)
+View(jp_part_index_1)
+dim(jp_dt)
+
+train_jp <- jp_dt[jp_part_index_1,]#index the 70%
+tune_and_test_jp <- jp_dt[-jp_part_index_1, ]#index everything but the %70
+
+#Then we need to use the function again to create the tuning set 
+
+jp_tune_and_test_index <- createDataPartition(tune_and_test_jp$status_Placed,
+                                           p = .5,
+                                           list = FALSE,
+                                           times = 1)
+
+tune_jp <- tune_and_test_jp[jp_tune_and_test_index, ]
+test_jp <- tune_and_test_jp[-jp_tune_and_test_index, ]
+
+```
+
+
+```{r}
+dim(train_jp)
+dim(tune_jp)
+dim(test_jp)
+
+table(train_jp$status_Placed)#check the prevalance
+100/(51+100)
+table(test_jp$status_Placed)
+24/(8+24)
+table(tune_jp$status_Placed)
+```
+
+
+### Step three: What do your instincts tell you about the data? Can it address your problem, what areas/items are you worried about?
+
+I think this data could potentially address the problem, although I worry there may not be enough observations. Also the class imbalance could be problematic - many more students had a status of 'placed' compared to 'not placed'. 
