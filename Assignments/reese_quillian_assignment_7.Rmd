@@ -1,0 +1,387 @@
+---
+title: "DT Lab"
+author: "Reese Quillian"
+date: "March 20, 2023"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Congrats! You just graduated UVA's MSDS program and got a job working at a movie studio in Hollywood. 
+
+Your boss is the head of the studio and wants to know if they can gain a competitive advantage by predicting new movies that might get high imdb scores (movie rating). 
+
+You would like to be able to explain the model to the mere mortals but need a fairly robust and flexible approach so you've chosen to use decision trees to get started. 
+
+In doing so, similar to  great data scientists of the past you remembered the excellent education provided to you at UVA in a undergrad data science course and have outline 20ish steps that will need to be undertaken to complete this task. As always, you will need to make sure to #comment your work heavily. 
+
+
+Footnotes: 
+-	You can add or combine steps if needed
+-	Also, remember to try several methods during evaluation and always be mindful of how the model will be used in practice.
+- Make sure all your variables are the correct type (factor, character,numeric, etc.)
+
+```{r}
+#0 Load libraries
+library(rio)
+library(plyr)
+library(tidyverse)
+library(rpart)
+library(psych)
+library(pROC)
+library(rpart.plot)
+library(rattle)
+library(caret)
+library(mlbench)
+library(mice)
+```
+
+
+```{r}
+#1 Load the data and ensure the labels are correct. restate the question and comment on evaluation metrics that you might pay attention to.  
+movies <- read.csv("data/movie_metadata.csv")
+movies <- movies[complete.cases(movies),]
+str(movies)
+```
+
+Question: Predicting which movies get a high rating from IMDB. 
+  * high rating = greater than 7.5
+  
+Evaluation metrics:
+  * sensitivity - we want to be able to predict a good movie really well to offer better         recommendations
+
+```{r}
+#2 Ensure all the variables are classified correctly including the target variable and collapse factor variables as needed. 
+
+# factor variables: color, genre, content_rating
+table(movies$color) # one missing value still, let's remove it - row 3639
+movies <- movies %>% filter(color != "")
+
+unique(movies$genres) # so there are 753 different genres because multiple are listed - let's look at just the first for each
+
+movies <- movies %>% mutate(genre_main = sub("\\|.*", "", genres))
+table(movies$genre_main)
+
+# let's group into 4 levels: action/adventure, comedy, drama, and "other"
+movies$genre_main <- fct_collapse(movies$genre_main, 
+                                  action_adv = c("Action", "Adventure"),
+                                  comedy = "Comedy",
+                                  drama = "Drama",
+                                  other = c("Animation","Biography","Documentary",
+                                            "Family","Fantasy",
+                                            "Musical","Romance","Sci-Fi","Western",
+                                            "Crime","Horror","Thriller","Mystery"))
+table(movies$genre_main) # this may need to be collapsed more later, but will leave for now
+```
+
+```{r}
+# the other factor variables
+table(movies$country) # most are USA - we can make this binary
+movies <- movies %>% mutate(country = case_when(country == "USA" ~ "USA", 
+                                                TRUE ~ "other"))
+
+table(movies$content_rating) # collapse this to: R or not R for a more even split
+movies <- movies %>% mutate(content_rating = case_when(content_rating == "R" ~ "R",
+                                                       TRUE ~ "other"))
+table(movies$content_rating)
+```
+
+
+```{r}
+# create factor target variable: imdb score > 7.5
+summary(movies$imdb_score)
+movies <- movies %>% mutate(rating = case_when(imdb_score >= 7.5 ~ "high",
+                                               TRUE ~ "average"))
+table(movies$rating)
+```
+
+
+```{r}
+# now that all the factors are collapsed, change them to factor types
+(column_index <- tibble(colnames(movies)))
+movies[,c(1,21,22,29,30)] <- lapply(movies[,c(1,21,22,29,30)], as.factor)
+
+# drop columns: director name, actor names, genres, movie title, plot keywords, link, language
+movies <- movies[,-c(2,7,10:12,15:18,20,26)]
+str(movies)
+```
+
+
+```{r}
+#3 Check for missing variables and correct as needed.  
+md.pattern(movies,rotate.names = TRUE) # all missing values have been corrected
+```
+
+
+```{r}
+#4 Guess what, you don't need to standardize the data,because DTs don't require this to be done, they make local greedy decisions...keeps getting easier, go to the next step
+
+# also no need to one hot encode
+```
+
+
+```{r}
+#5 Determine the baserate or prevalence for the classifier, what does this number mean? (Need to cut the target appropriately)  
+
+table(movies$rating)
+
+644 / (644 + 3156) # prevalance = ~17%
+# aka the 'high' rating classification is observed in 17% of the data
+```
+
+```{r}
+#6 Split your data into test, tune, and train. (80/10/10)
+set.seed(1989)
+part_index_1 <- createDataPartition(movies$rating,
+                                           times=1,
+                                           p = 0.80,
+                                           groups=1,
+                                           list=FALSE)
+train <- movies[part_index_1,]
+tune_and_test <- movies[-part_index_1, ]
+tune_and_test_index <- createDataPartition(tune_and_test$rating,
+                                           p = .5,
+                                           list = FALSE,
+                                           times = 1)
+tune <- tune_and_test[tune_and_test_index, ]
+test <- tune_and_test[-tune_and_test_index, ]
+
+```
+
+```{r}
+#7 Build your model using the training data, rpart2, and repeated cross validation as reviewed in class with the caret package.
+
+# features and classes first
+features <- train[,-19] #drop target variable. 
+target <- train$rating
+
+str(features)
+str(target)
+```
+
+
+```{r}
+# control training
+fitControl <- trainControl(method = "repeatedcv", # repeated cross validation
+                          number = 10,
+                          repeats = 5,
+                          classProbs = TRUE,
+                          summaryFunction = twoClassSummary) 
+```
+
+
+```{r}
+# set hyper parameter search
+tree.grid <- expand.grid(maxdepth=c(5,7,9,11,13))
+
+# ready to train
+set.seed(1984)
+
+
+movie_model <- train(x=features,
+                y=target,
+                method="rpart2",#type of model uses maxdepth to select a model
+                trControl=fitControl,#previously created
+                tuneGrid=tree.grid,#expanded grid
+                metric="ROC")
+
+```
+
+
+```{r}
+#8 View the results, comment on how the model performed and which variables appear to be contributing the most (variable importance)  
+
+movie_model$results # max depth of 13 has the highest ROC, sensitivity and specificity
+# sensitivity is virtually the same for all, only decreases slightly
+# specificity is about predicting the negative class correctly, so this model is better at guessing what a good movie is over a bad one
+
+plot(movie_model) # big jump up from 7 to 9, 11 and 13 pretty similar
+
+varImp(movie_model) # number of voted users + number of users who reviewed it are the two highest
+# I find it surprising that budget was not more important
+# rating doesn't matter at all, nor does the number of facebook likes for the main actor
+```
+
+
+
+```{r}
+#9 Plot the output of the model to see the tree visually, using rpart.plot 
+rpart.plot(movie_model$finalModel, type=4,extra=101)
+# checks if budget is high first
+```
+
+```{r}
+#10 Use the tune set and the predict function with your model to predict the target variable, making sure to produce probabilities.
+
+movie_pred_tune = predict(movie_model,tune,tune$rating, type= "prob")# probabilities
+View(as_tibble(movie_pred_tune))
+
+movie_pred_tune_labels = predict(movie_model,tune,tune$rating,type = "raw") # labels
+View(as_tibble(movie_pred_tune_labels))
+
+predictions <- cbind(movie_pred_tune,movie_pred_tune_labels) # combine probabilities + labels
+View(as_tibble(predictions))
+```
+
+```{r}
+#11 Use the the confusion matrix function on your predictions to check a variety of metrics and comment on the metric that might be best for this type of analysis given your question.  
+
+caret::confusionMatrix(movie_pred_tune_labels, 
+                as.factor(tune$rating), 
+                dnn=c("Prediction", "Actual"),
+                positive="high",
+                mode = "everything")
+
+# Sensitivity : 0.50000         
+# Specificity : 0.97152    
+# Accuracy    : 0.8921
+
+# The model is much better at predicting what is going to be an average movie than a highly rated movie
+# Of the highly rated movies, it is only predicting half of them correctly
+```
+
+```{r}
+#12 With the percentages you generated in step 10,select several different threshold levels using the threshold function we created and interpret the results. What patterns do you notice, did the evaluation metrics change? 
+
+# function
+adjust_thres <- function(x, y, z) {
+  #x=pred_probablities, y=threshold, z=tune_outcome
+  thres <- as.factor(ifelse(x > y, "high","average"))
+  confusionMatrix(thres, z, positive = "high", dnn=c("Prediction", "Actual"), mode = "everything")
+}
+```
+
+
+```{r}
+# below 0.5
+# adjust_thres(movie_pred_tune$high,y=.3,tune$rating)
+# adjust_thres(movie_pred_tune$high,y=.2,tune$rating)
+adjust_thres(movie_pred_tune$high,y=.175,tune$rating) # sensitivity is much better, 0.68
+```
+
+```{r}
+# above 0.5 
+adjust_thres(movie_pred_tune$high,y=.6,tune$rating) # no real change
+```
+
+Raising the threshold doesn't do much, because at the 0.5 threshold the specificity is already really high. Lowering the threshold causes a slight decrease in accuracy but improves the sensitivity significantly.
+
+
+```{r}
+#13 Based on your understanding of the model and data adjust the hyper-parameter via the built in train control function in caret or build and try new features, does the model quality improve or not? If so how and why, if not, why not?
+
+# we can remove the features that are not important (anything below 5 from variable importance)
+# aspect_ratio                2.903
+# color                       2.649
+# content_rating              0.000
+# actor_1_facebook_likes      0.000
+
+# this likely will not improve performance, but will make a simpler model to try adjusting the hyper parameters with
+
+(column_index <- tibble(colnames(movies)))
+movies2 <- movies[,-c(1,6,12,16)]
+str(movies2)
+
+set.seed(1989)
+part_index_2 <- createDataPartition(movies2$rating,
+                                           times=1,
+                                           p = 0.80,
+                                           groups=1,
+                                           list=FALSE)
+train2 <- movies2[part_index_2,]
+tune_and_test2 <- movies2[-part_index_2, ]
+tune_and_test_index2 <- createDataPartition(tune_and_test2$rating,
+                                           p = .5,
+                                           list = FALSE,
+                                           times = 1)
+tune2 <- tune_and_test2[tune_and_test_index2, ]
+test2 <- tune_and_test2[-tune_and_test_index2, ]
+
+features2 <- train2[,-15] #drop target variable. 
+target2 <- train2$rating
+
+# using the same hyper parameters, new features
+
+movie_model2 <- train(x=features2,
+                y=target2,
+                method="rpart2",#type of model uses maxdepth to select a model
+                trControl=fitControl,#previously created
+                tuneGrid=tree.grid,#expanded grid
+                metric="ROC")
+
+movie_pred_tune_labels2 = predict(movie_model2,tune2,tune2$rating,type = "raw")
+
+# confusion matrix
+caret::confusionMatrix(movie_pred_tune_labels2, 
+                as.factor(tune2$rating), 
+                dnn=c("Prediction", "Actual"),
+                positive="high",
+                mode = "everything")
+
+# accuracy decreases a bit but sensitivity increases above 50% - use these variables to try new hyperparameters
+```
+
+
+```{r}
+# try changing the hyper-parameters, 14 features from above
+# change method: 
+fitControl2 <- trainControl(method = "boot_all", #new
+                          number = 10,
+                          #repeats = 5,
+                          classProbs = TRUE,
+                          summaryFunction = twoClassSummary) 
+
+movie_model3 <- train(x=features2,
+                y=target2,
+                method="rpart2",
+                trControl=fitControl2,
+                tuneGrid=tree.grid,# same as before
+                metric="ROC") 
+```
+
+
+```{r}
+# results of new model
+movie_pred_tune3 = predict(movie_model3,tune2,tune2$rating, type= "prob")# probabilities
+
+movie_pred_tune_labels3 = predict(movie_model3,tune2,tune2$rating,type = "raw") # labels
+
+caret::confusionMatrix(movie_pred_tune_labels3, 
+                as.factor(tune$rating), 
+                dnn=c("Prediction", "Actual"),
+                positive="high",
+                mode = "everything")
+
+# this is worse - go forward with model 2 (less features, repeated cv)
+```
+
+
+```{r}
+#14 Once you are confident that your model is not improving, via changes implemented on the training set and evaluated on the the tune set, predict with the test set and report final evaluation of the model. Discuss the output in comparison with the previous evaluations.  
+
+# use 2nd model movie_model2 with lower threshold of 0.175 because we want higher sensitivity
+
+movie_pred_test = predict(movie_model2,test2,test2$rating, type= "prob")
+
+adjust_thres(movie_pred_test$high,y=.175,test2$rating)
+# accuracy 84%
+# sensitivity 57% (ok, really just want to make sure it is above 50%)
+# specificity 89%
+```
+
+Compared to the previous evaluations, this model performed pretty well. Though each metric is lower than it was when we adjusted the threshold on the tune set with the model with all 18 features, the sensitivity is still above 57% and the accuracy is still sufficiently high.
+
+
+```{r}
+#15 Summarize what you learned along the way and make recommendations on how this could be used moving forward, being careful not to over promise. 
+
+#16 What was the most interesting or hardest part of this process and what questions do you still have? 
+```
+
+Throughout this exploration, I learned that it is a lot harder to predict what's going to be a highly rated movie than a movie that is just ok. That being said, this decision tree model is still able to predict a movie with a high rating at better than random, so there could still be advantages in using it to provide recommendations to the movie studio about what kinds of movies they should pay attention to. 
+
+The hardest part of this process was tuning the hyperparameters, and the most interesting part was looking at which variables are important in the model. My only question is what kind of model would do better at predicting a highly rated movie...
