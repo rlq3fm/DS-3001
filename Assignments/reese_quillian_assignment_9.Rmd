@@ -1,0 +1,386 @@
+---
+title: "NBA Picks"
+subtitle: "DS 3001 Clustering Lab"
+author: "Reese Quillian"
+date: "2023-04-17"
+output:
+  html_document:
+    theme: flatly
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE, cache=TRUE}
+knitr::opts_chunk$set(echo = TRUE,warning=FALSE,message=FALSE)
+```
+
+
+This report provides findings for scouting players that are high performing and not well paid for the team to recruit. 
+
+
+Provide a well commented and clean (knitted) report of your findings that can be presented to your GM. Include a rationale for variable selection, details on your approach and a overview of the results with supporting visualizations. 
+ 
+
+```{r, include=FALSE}
+# first - libraries
+library(tidyverse)
+library(plotly)
+library(htmltools)
+library(devtools)
+library(caret)
+library(NbClust)
+library(corrplot)
+```
+
+
+```{r, include=FALSE}
+# load data
+
+stats <- read_csv("data/nba2020-21.csv")
+salaries <- read_csv("data/nba_salaries_21.csv")
+
+#View(stats)
+#View(salaries)
+
+colnames(salaries)[2] = "Salary"
+```
+
+
+```{r, include=FALSE}
+# now, clean & standardize data
+# First, What does the data look like?
+str(stats)
+# only non-numeric data are player name, position, and team
+# position can be a factor:
+table(stats$Pos)
+stats$Pos <- as.factor(stats$Pos)
+
+# now normalize numeric vars
+# normalize function
+# added na.rm argument so that NA values are not counted as min
+normalize <- function(x){
+  # x is a numeric vector because the functions min and max require
+  #numeric inputs
+ (x - min(x,na.rm=TRUE)) / (max(x,na.rm=TRUE) - min(x,na.rm=TRUE))#numerator subtracts the minimum value of x from the entire column, denominator essentially calculates the range of x 
+}
+
+# normalize variables:
+num_cols <- names(select_if(stats, is.numeric))
+num_cols
+stats[num_cols] <- lapply(stats[num_cols], normalize)
+str(stats)
+```
+
+
+```{r, include=FALSE}
+#Select the variables to be included in the cluster 
+# Check which are most correlated with salary
+
+# adjust names
+stats$Player <- gsub("[^[:alnum:]]", "", stats$Player)
+salaries$Player <- gsub("[^[:alnum:]]", "", salaries$Player)
+
+data <- inner_join(stats, salaries)
+# normalize salary column too
+data$Salary <- normalize(data$Salary)
+str(data)
+
+numeric_data <- data[-c(1,2,4)] # drop non-numeric variables
+numeric_data <- numeric_data[complete.cases(numeric_data),] # only complete cases
+```
+
+## Variable Selection
+
+The first step is to see which variables are most correlated with salary:
+
+```{r, echo=FALSE}
+# correlation matrix
+cor_matrix <- cor(numeric_data)
+corrplot(cor_matrix, type="upper")
+```
+
+The two most correlated are points (PTS) and assists (AST) with correlations of 0.59 and 0.58, respectively. These will be used for the two centers for the clustering algorithm. Players with both high points and high assists are considered high performing. 
+
+
+```{r, include=FALSE}
+#Run the clustering algo with 2 centers
+
+# create data frame to include: salary, points, assists, player name
+all_data <- data[,c("Player","PTS","AST","Salary")]
+all_data <- all_data[complete.cases(all_data),] # only complete cases
+str(all_data)
+
+cluster_data <- all_data[,c("PTS","AST")]
+
+set.seed(1)
+kmeans_obj = kmeans(cluster_data, centers = 2, 
+                        algorithm = "Lloyd") 
+```
+
+
+```{r, include=FALSE}
+#View the results
+kmeans_obj # 59.2% of the variance explained by these clusters
+
+clusters = as.factor(kmeans_obj$cluster)
+```
+
+
+## Clustering Algorithm Results
+
+Using a clustering algorithm with two clusters (or groups), we obtain the following results:
+
+
+```{r, echo=FALSE}
+#Visualize the output
+
+ggplot(all_data, aes(x = PTS, 
+                  y = AST,
+                  shape = clusters)) + 
+  geom_point(size = 6) +
+  ggtitle("Points and Assists of NBA players") +
+  xlab("Number of points") +
+  ylab("Number of assists") +
+  scale_shape_manual(name = "Cluster", 
+                     labels = c("Cluster 1", "Cluster 2"),
+                     values = c("1", "2")) +
+  theme_light()
+```
+
+
+We can use these results from the clustering algorithm to view salary as well, and identify which players may be high performing and underpaid.
+
+```{r,echo=FALSE}
+# Now view with salary
+
+plot1 <- ggplot(all_data, aes(x = PTS,
+                  y = AST,
+                  color = Salary,
+                  shape = clusters,
+                  text =  paste("Player:", Player))) + 
+  geom_point(size=2) +
+  ggtitle("Points and Assists of NBA players") +
+  xlab("Number of points") +
+  ylab("Number of assists") +
+  scale_shape_manual(name = "Cluster", 
+                     labels = c("Cluster 1", "Cluster 2"),
+                     values = c("1", "2")) +
+  scale_color_gradient(low = "lightblue", high = "darkred") +
+  theme_light()
+
+ggplotly(plot1)
+```
+
+The use of two clusters accounts for 59.2% of the variance in the data. This is ok, but we can improve this with more clusters. 
+
+```{r, include=FALSE}
+#Evaluate the quality of the clustering 
+
+# Inter-cluster variance,
+inter = kmeans_obj$betweenss
+
+total = kmeans_obj$totss
+
+# Variance accounted for by clusters.
+(var = inter / total)
+# 59.2 percent - pretty good, let's try to improve with more clusters
+```
+
+
+## Evaluating different numbers of clusters
+
+2 clusters was ok, but we want more clusters so we can see which players are really high performing. We can use the elbow method to see how much variance can be explained by using 2-10 clusters.
+
+```{r, include=FALSE}
+#Use the function we created to evaluate several different number of clusters
+
+# define function
+explained_variance = function(data_in, k){
+  
+  # Running the kmeans algorithm.
+  set.seed(1)
+  kmeans_obj = kmeans(data_in, centers = k, algorithm = "Lloyd", iter.max = 30)
+  
+  # Variance accounted for by clusters:
+  # var_exp = intercluster variance / total variance
+  var_exp = kmeans_obj$betweenss / kmeans_obj$totss
+  var_exp  
+}
+```
+
+
+```{r, include=FALSE}
+# use function for k = 2:10
+explained_var = sapply(2:10, explained_variance, data_in = cluster_data)
+(as_tibble(explained_var))
+
+# jumping up to 3 clusters explains a lot more variance
+
+# create dataframe for elbow chart
+# Data for ggplot2.
+elbow_data = data.frame(k = 2:10, explained_var)
+#View(elbow_data)
+```
+
+
+```{r, echo=FALSE}
+#Create a elbow chart of the output 
+ggplot(elbow_data, 
+       aes(x = k,  
+           y = explained_var)) + 
+  geom_point(size = 4) +           #<- sets the size of the data points
+  geom_line(size = 1) +            #<- sets the thickness of the line
+  xlab('Number of clusters (k)') + 
+  ylab('Inter-cluster Variance / Total Variance') + 
+  theme_light()
+```
+
+
+```{r, include=FALSE}
+#Use NbClust to select a number of clusters
+
+# run NbClust
+(nbclust_obj = NbClust(data = cluster_data, method = "kmeans"))
+
+# view output
+nbclust_obj
+
+# selection
+View(nbclust_obj$Best.nc)
+```
+
+Another method to use to identify the optimal amount of clusters is using the NbClust method. This method identifies the optimal number of clusters under different criteria. Below is a graph of the number of votes for each number of clusters.
+
+```{r, include=FALSE}
+#Display the results visually 
+# Subset the 1st row from Best.nc and convert it 
+# to a data frame so ggplot2 can plot it.
+freq_k = nbclust_obj$Best.nc[1,]
+freq_k = data.frame(freq_k)
+View(freq_k)
+```
+
+```{r, echo=FALSE}
+# Plot as a histogram.
+ggplot(freq_k,
+       aes(x = freq_k)) +
+  geom_bar() +
+  scale_x_continuous(breaks = seq(0, 15, by = 1)) +
+  scale_y_continuous(breaks = seq(0, 10, by = 1)) +
+  labs(x = "Number of Clusters",
+       y = "Number of Votes",
+       title = "Cluster Analysis")
+```
+
+We see that the elbow method and the NbClust method yield pretty different results in the optimal number of clusters. We will run the algorithm using 4 clusters to compromise between each method's results without overfitting.
+
+
+```{r, include=FALSE}
+#Using the recommended number of cluster compare the output to the elbow chart method, assuming it's different. 
+# the number of cluster method recommends 2 or 3. 
+# the elbow chart method recommends more
+
+# repeat earlier steps with 4 clusters to find players we want and players we don't
+
+kmeans_obj = kmeans(cluster_data, centers = 4, 
+                        algorithm = "Lloyd") 
+kmeans_obj # 82 percent of variance
+
+clusters = as.factor(kmeans_obj$cluster)
+```
+
+
+Results after using 4 clusters:
+
+```{r, echo=FALSE}
+# viewing output
+
+plot <- ggplot(all_data, aes(x = PTS,
+                  y = AST,
+                  color = Salary,
+                  shape = clusters,
+                  text =  paste("Player:", Player))) + 
+  geom_point(size=2) +
+  ggtitle("Points and Assists of NBA players") +
+  xlab("Number of points") +
+  ylab("Number of assists") +
+  scale_shape_manual(name = "Cluster", 
+                     labels = c("Cluster 1", "Cluster 2","Cluster 3","Cluster 4"),
+                     values = c("1", "2","3","4")) +
+  scale_color_gradient(low = "lightblue", high = "darkred") +
+  theme_light()
+
+ggplotly(plot)
+```
+
+You can hover over the plot to identify the points, assists, cluster, and player name. Note that this data is normalized; we will look at the true values in the following section.
+
+## Player Selection
+
+### Yes - players we want
+
+We want players with a high number of points and assists, but low current salaries. On the chart above, this is data points that are in cluster 4 (x's) but are lighter blue in color. You can see three points that meet these criteria on the top right of the plot. These players are:
+
+1) TraeYoung
+2) LukaDoni
+3) DeAaronFox
+
+Data for these players:
+
+```{r, include=FALSE}
+# players with high points/assists but low salary
+# get not-standardized data 
+stats <- read_csv("data/nba2020-21.csv")
+salaries <- read_csv("data/nba_salaries_21.csv")
+
+stats$Player <- gsub("[^[:alnum:]]", "", stats$Player)
+salaries$Player <- gsub("[^[:alnum:]]", "", salaries$Player)
+
+og_data <- inner_join(stats, salaries)
+
+selected_players <- c("TraeYoung","LukaDoni","DeAaronFox")
+```
+
+
+```{r,echo=FALSE}
+og_data %>% filter(Player %in% selected_players) %>% select(Player,Pos,Age,Tm,PTS,AST,`2020-21`)
+```
+
+All three of these players are point guards - let's find some other players we would want to hire that play other positions.
+
+1) DonovanMitchell
+2) ShaiGilgeousAlexander
+
+```{r,echo=FALSE}
+og_data %>% filter(Player %in% c("DonovanMitchell","ShaiGilgeousAlexander")) %>% select(Player,Pos,Age,Tm,PTS,AST,`2020-21`)
+```
+
+Both of these players are shooting guards, and are not currently being paid well yet still have high performance. These would be good additions to the team.
+
+### No - players we don't want
+
+Players that the team definitely does not want are those who are already very highly paid, or are not good, or both. Three that we definitely do not want on the team are: 
+
+1) JimmyButler
+2) MikeConley
+3) JohnWall
+
+Each of these players are being paid a lot and have less points and assists than those identified in the previous section. Here are their stats:
+
+
+```{r,echo=FALSE}
+as_tibble(og_data %>% filter(Player %in% c("JimmyButler","MikeConley","JohnWall")) %>% select(Player,Pos,Age,Tm,PTS,AST,`2020-21`))
+```
+
+
+### Maybe - these players aren't great, and have average salaries
+
+Unsure about these players:
+
+1) GarrettTemple
+2) WillBarton
+3) TJMcConnell
+
+```{r,echo=FALSE}
+as_tibble(og_data %>% filter(Player %in% c("GarrettTemple","WillBarton","TJMcConnell")) %>% select(Player,Pos,Age,Tm,PTS,AST,`2020-21`))
+```
