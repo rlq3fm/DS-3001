@@ -1,0 +1,371 @@
+---
+title: "Random_Forest_Lab"
+author: "Brian Wright"
+date: "11/16/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The goal of this lab is to optimize a Random Forest model using the provided dataset.  The guidance this week is less prescriptive in terms of steps, so use the skills you have gained over the semester to build and evaluate the RF model. You will be graded on your model building, interpretation of the results and explanation of model selection. As always, rely on your teams but submit your own code. Lastly, there are likely several correct approaches involving a variety of different conclusions, just make sure your conclusions are supported by your approach.    
+
+The dataset should be familiar as it's the census data, on 32,000+ individuals with a variety of variables and a target variable for above or below 50k in salary. 
+
+Your goal is to build a Random Forest Classifier to be able to predict income levels above or below 50k.
+
+```{r,include=FALSE}
+# load libraries
+library(tidyverse)
+#install.packages("plyr")
+library(plyr)
+library(plotly)
+library(randomForest)
+library(rio)
+library(caret)
+library(ROCR)
+library(tidyverse)
+library(rpart)
+#install.packages("pscyh")
+library(psych)
+library(pROC)
+#install.packages("rpart.plot")
+library(rpart.plot)
+#install.packages("rattle")
+library(rattle)
+```
+
+
+
+Load data: 
+```{r}
+url <- "https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.data"
+
+census <- read_csv(url, col_names = FALSE)
+
+colnames(census) <- c("age","workclass","fnlwgt","education","education_num","marital_status","occupation","relationship","race","sex","capital_gain","capital_loss","hours_per_week","native_country","income")
+
+
+View(census)
+
+```
+
+
+Clean data: 
+
+```{r}
+# cleaning
+str(census)
+
+# some variables have ? instead of NA values. First turn all question marks to NA
+census$workclass <- gsub("?",NA,census$workclass, fixed = TRUE)
+census$occupation <- gsub("?",NA,census$occupation, fixed = TRUE)
+census$native_country <- gsub("?",NA,census$native_country, fixed = TRUE)
+
+str(census)
+
+# change to factors: workclass, education, marital_status, relationship, race, sex, income
+
+factors = c("workclass","education","marital_status","relationship",
+            "race","sex","income")
+
+census[,factors]<-lapply(census[,factors],as.factor)
+str(census)
+
+# change income column to 1's and 0's
+
+census <- census %>% mutate(income = case_when(
+                                    income == ">50K" ~ 1,
+                                    TRUE ~ 0))
+census$income <- as.factor(census$income)
+str(census)
+
+# might need to collapse some factors - marital status
+# combine married categories (married-af-spouse,married-civ-spouse,married-spouse-absent)
+
+census$marital_status <- fct_collapse(census$marital_status, 
+                           married=c("Married-AF-spouse", "Married-civ-spouse",
+                                     "Married-spouse-absent"),
+                           divorced="Divorced",
+                           never_married = "Never-married",
+                           separated ="Separated",
+                           widow = "Widowed")
+
+# also education
+# combine 9th, 10th, 11th, 12th,HS-grad -> high school, 1st-4th,5-6th,7-8th,preschool -> middle school, masters,doctorate,prof-school -> grad school
+census$education <- fct_collapse(census$education, 
+                           high_school=c("10th", "11th","12th","9th",
+                                     "HS-grad"),
+                           middle_school=c("1st-4th","5th-6th","7th-8th","Preschool"),
+                           grad_school = c("Masters","Doctorate","Prof-school"),
+                           assoc = c("Assoc-acdm","Assoc-voc"),
+                           bach = "Bachelors",
+                           some_college = "Some-college")
+
+
+# we can get rid of education_num column - this is just a code for education level
+census<- census[,-5]
+
+# finally collapse work class - combine never worked + without pay with self employed not income
+census$workclass <- fct_collapse(census$workclass, 
+                                not_inc=c("Never-worked", "Without-pay","Self-emp-not-inc"))
+
+str(census)
+
+census <- census[complete.cases(census), ]
+
+View(census) # looks good; cleaning done
+```
+
+
+Below are a few key steps to include but are certainly not everything you will need. 
+
+Remember to review the prevalence/baseline of the target variable to give yourself and idea of well the model is working. (Always start by going through all the necessary steps to prepare the data for ML)
+
+Calculate the initial income level 
+
+```{r}
+table(census$income)
+
+(prevalence <- table(census$income)[[2]]/length(census$income)) #0.25
+# 25% of the observations are income above 50k
+```
+
+
+```{r}
+# test and train set first
+
+sample_rows = 1:nrow(census)
+str(sample_rows)
+
+# sample() is a randomized function, use set.seed() to make your results reproducible.
+set.seed(1984) #sample(x, size, replace = FALSE, prob = NULL)
+test_rows = sample(sample_rows,
+                   dim(census)[1]*.10, #start with 10% of our dataset, could do 20%
+                   # but random forest does require more training data because of the 
+                   # sampling so 90% might be a better approach with this small of a dataset
+                   replace = FALSE)# We don't want duplicate samples
+
+str(test_rows)
+
+# Partition the data between training and test sets using the row numbers the
+# sample() function selected, using a simplified version for the lab you'll need 
+# to create three segments 
+census_train = census[-test_rows,]
+census_test = census[test_rows,]
+
+table(census_train$income)
+6763/(6763+20383)
+
+table(census_test$income)
+745/(745+2271)
+```
+
+Run the initial RF model with 1000 trees 
+```{r}
+mytry_tune <- function(x){
+  xx <- dim(x)[2]-1
+  sqrt(xx)
+}
+
+
+mytry_tune(census) #3.6; round up to 4
+
+census_RF = randomForest(income~., 
+                            census_train, 
+                            #y = NULL,         
+                            #subset = NULL,
+                            #xtest = NULL, 
+                            #ytest = NULL,
+                            ntree = 1000,  # 1000 trees
+                            mtry = 4,            # sqrt(# of variables)
+                            replace = TRUE,      #<- Should sampled data points be replaced.
+                            #classwt = NULL,     
+                            #strata = NULL,      #<- Not necessary for our purpose here.
+                            sampsize = 100,      #<- Size of sample to draw each time.
+                            nodesize = 5,        #<- min data points in terminal nodes.
+                            #maxnodes = NULL,    #<- Limits the number of maximum splits. 
+                            importance = TRUE,   #<- assess importance of predictors 
+                            #localImp = FALSE,  
+                            proximity = FALSE,    #<- calculate proximity measure between 
+                            norm.votes = TRUE,   
+                            do.trace = TRUE,     
+                            keep.forest = TRUE,  
+                            keep.inbag = TRUE)
+```
+
+```{r}
+# output
+census_RF
+```
+
+```{r}
+census_RF$call
+
+# Call up the confusion matrix and check the accuracy of the model.
+census_RF$confusion # not good at identifying the positive class
+census_RF_acc = sum(census_RF$confusion[row(census_RF$confusion) == 
+                    col(census_RF$confusion)]) /sum(census_RF$confusion)
+
+census_RF_acc #84
+```
+
+
+Take a look at the variable importance measures, are they what you expected?
+```{r}
+View(as.data.frame(census_RF$importance))
+```
+
+The three most important variables for identifying income over 50k are (based on the total mean decrease accuracy):
+1) marital status
+2) relationship
+3) education
+
+This is mostly to be expected, but I am surprised that occupation was not higher.
+
+Use the training and tune datasets to optimize the model in consideration of the number of trees, the number of variables to sample and the sample size that optimize the model output.
+
+```{r}
+# improve ability to identify the positive target class
+census_RF2 = randomForest(income~., 
+                            census_train, 
+                            #y = NULL,         
+                            #subset = NULL,
+                            #xtest = NULL, 
+                            #ytest = NULL,
+                            ntree = 500,        # CHANGE
+                            mtry = 6,            # CHANGE
+                            replace = TRUE,      
+                            #classwt = NULL,     
+                            #strata = NULL,   
+                            sampsize = 200,      #CHANGE
+                            nodesize = 5,       
+                            #maxnodes = NULL,    
+                            importance = TRUE,   
+                            #localImp = FALSE,  
+                            proximity = FALSE,    
+                            norm.votes = TRUE,   
+                            do.trace = TRUE,     
+                            keep.forest = TRUE,  
+                            keep.inbag = TRUE)
+```
+
+```{r}
+census_RF$confusion
+census_RF2$confusion # better at positive class
+```
+
+```{r}
+# try one more
+census_RF3 = randomForest(income~., 
+                            census_train, 
+                            #y = NULL,         
+                            #subset = NULL,
+                            #xtest = NULL, 
+                            #ytest = NULL,
+                            ntree = 750,        # CHANGE
+                            mtry = 6,            # CHANGE
+                            replace = TRUE,      
+                            #classwt = NULL,     
+                            #strata = NULL,   
+                            sampsize = 200,      #CHANGE
+                            nodesize = 5,       
+                            #maxnodes = NULL,    
+                            importance = TRUE,   
+                            #localImp = FALSE,  
+                            proximity = FALSE,    
+                            norm.votes = TRUE,   
+                            do.trace = TRUE,     
+                            keep.forest = TRUE,  
+                            keep.inbag = TRUE)
+```
+
+```{r}
+census_RF2$confusion
+census_RF3$confusion # slightly better - go with this one
+```
+
+
+Once a final model has been selected (hyper-parameters of the model are set), evaluate the model using the test dataset. 
+```{r}
+# model selected uses 750 trees; 6 variables sampled and a sample size of 200
+census_predict = predict(census_RF3,      
+                         census_test,
+                         type = "response",   
+                         predict.all = TRUE)
+
+full<-confusionMatrix(as.factor(census_predict$aggregate),as.factor(census_test$income),
+                positive = "1", dnn=c("Prediction", "Actual"), mode = "everything")
+full
+```
+
+
+Reduce the size of the dataset using the variable importance measure as a metric for variable selection (reduction the feature space). There's not a set rule here on how to select the variables, so just experiment and track the results. 
+
+Drop 5 variables: native_country, race, fnlwgt, workclass, sex
+
+```{r}
+(column_index <- tibble(colnames(census)))
+census_test2 <- census_test[,-c(2:3,8:9,13)]
+census_train2 <- census_train[,-c(2:3,8:9,13)]
+```
+
+
+Rebuild the model using the sparse dataset. 
+
+Rebuilding census_RF3 model, which had best sensitivity
+
+```{r}
+census_RF3_sparse = randomForest(income~., 
+                            census_train2, 
+                            #y = NULL,         
+                            #subset = NULL,
+                            #xtest = NULL, 
+                            #ytest = NULL,
+                            ntree = 750,        # CHANGE
+                            mtry = 6,            # CHANGE
+                            replace = TRUE,      
+                            #classwt = NULL,     
+                            #strata = NULL,   
+                            sampsize = 200,      #CHANGE
+                            nodesize = 5,       
+                            #maxnodes = NULL,    
+                            importance = TRUE,   
+                            #localImp = FALSE,  
+                            proximity = FALSE,    
+                            norm.votes = TRUE,   
+                            do.trace = TRUE,     
+                            keep.forest = TRUE,  
+                            keep.inbag = TRUE)
+```
+
+
+```{r}
+# look at results
+census_predict2 = predict(census_RF3_sparse,      
+                         census_test2,
+                         type = "response",   
+                         predict.all = TRUE)
+
+sparse<-confusionMatrix(as.factor(census_predict2$aggregate),as.factor(census_test2$income),
+                positive = "1", dnn=c("Prediction", "Actual"), mode = "everything")
+sparse
+# even better results than before 
+```
+
+
+Summarize your findings. Compare the full model and the sparse model, did they perform the same? Think about not only evaluation measures but in training metrics (no. of trees etc). Which model would you recommend and why? 
+
+```{r}
+# view results
+sparse
+full
+```
+
+The sparse model actually performed better than the full model. Since these were constructed using the same hyperparameters, I would recommend using the sparse model, because it 1) has better performance, not only in overall accuracy but also in sensitivity, and 2) because it requires less computing power. 
+ 
+
+
